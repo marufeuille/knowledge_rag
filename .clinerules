@@ -58,9 +58,17 @@
 例) htmlを読み込みたいが大きいので、BeautifulSoupでbodyタグないの日本語のみを抽出したうえで読み込む
 
 # 仕様
-## クローリング
+## エントリーポイント
 
-実装状況: crawler.pyに実装
+CLIから呼び出すときのエントリーポイントとして機能し、引数や環境変数等を処理し、クローリング、前処理などの各関数を呼び出す
+
+呼び出し例
+
+```
+uv run python -m arknights_crawler.cli crawl --gcp_project_id hogehoge --gcs_bucket_name fugafuga
+```
+
+## クローリング
 
 クロール対象: https://arknights.wikiru.jp/index.php?plugin=sitemap  で表示されるsitemap
 
@@ -79,14 +87,20 @@
   - 記録する内容は id, filename, fetched_at
   - ある程度の単位でファイルは分割して問題ない
 
+引数
+- sitemap_url: サイトマップのURL(デフォルト値が指定されており、通常固定値)
+- output_dir: 取得したhtmlを保存するディレクトリ名のプレフィックス
+- meta_output_dir: メタデータ(JSONL)を保存するプレフィックス
+- meta_chunk_size: メタデータのレコード(JSONL)をファイル出力する単位
+- gcs_project: Google Cloud Storageのあるプロジェクト名
+- gcp_bucket_name: Google Cloud Storageのバケット名
+
 出力先
 - html/jsonlともにGCS上にアップロードする
 - できるだけ細かい単位でアップロードする
   - テスト時に簡単に確認できるように分ける単位を選択できることが望ましい
 
 ## データの前処理
-
-実装状況: 未実装
 
 背景: 取得したhtmlはメニュー部分などどのページにも入っている不要な情報が多くあるので除去したい
 
@@ -97,3 +111,18 @@
 出力先: 指定されたGCS上の output/extracted/{id}.html に抽出された部分のみを保存する
 
 メタデータ: id, original_html_id(crawler側のidへのFK相当), processed_at を output/meta/extracted_{YYYYMMDDhhmss}_{chunk_id}.jsonl として保存する
+
+引数:
+- --input-dir: 元となるhtmlがあるディレクトリ(通常はcrawler.pyの出力先に等しい)
+- --meta-chunk-size: メタデータのレコード(JSONL)をファイル出力する単位
+- --gcs-project: Google Cloud Storageのあるプロジェクト名
+
+# 設計
+## ソフトウェアアーキテクチャ
+
+- クリーンアーキテクチャのような重たいアーキテクチャは導入しないが、ある程度意識した構造にする
+- 関数はできるだけ純粋関数的に実装し、入出力はしっかり分ける
+  - ファイルやクラウドサービスへの外部入出力はrepositoryクラスや関数として切り出す
+  - 実際の処理をする関数への値渡しはパラメータ経由のみとし、グローバル変数等は使わない
+  - 実行時の引数や環境変数はある程度一箇所でパースし、入力されたデータと実装を切り離す
+- 機能ごとにディレクトリを切り、その中でファイルは凝集性を意識した単位でわける
