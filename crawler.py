@@ -1,54 +1,112 @@
 #!/usr/bin/env python3
 """
-Crawler script modified to integrate with the SQLite index and to use sitemap data.
+Crawler script for CloudRun jobs with assets stored on GCS.
 
-This script downloads pages referenced in a sitemap XML, rather than using a static list of URLs.
-It fetches the sitemap from a provided URL (defaults to "https://arknights.wikiru.jp/index.php?plugin=sitemap"),
-parses the XML to extract URLs and their last modification dates, and processes each URL using an SQLite
-database (output/index.db) to maintain an index. For each URL, only the file part (i.e., the path and query,
-excluding the scheme and domain) is stored in the database as original_filename.
+This script downloads pages referenced in a sitemap XML (default:
+"https://arknights.wikiru.jp/index.php?plugin=sitemap") and processes only those
+that have been updated since the last fetch. If the same URL appears with a newer
+lastmod than any previously fetched record, a new record (with a new id) is created.
+The output consists of:
 
-Before downloading a page, the file name (extracted from the URL) is compared against the database.
-If a record exists, the script compares the stored created_at timestamp with the sitemap's lastmod value.
-If the sitemap's lastmod is more recent than the stored created_at, the page is re-downloaded and the record
-is updated. Otherwise, if no record exists, a new record is created and the page is downloaded.
+1. HTML files – each downloaded page is saved locally as {id}.html (an id is used
+   because the original URL is too long for a file name). Each HTML file is immediately
+   uploaded to GCS.
+2. Meta information in JSON Lines format – each record contains:
+      id, filename, fetched_at.
+   These records (which also include the original URL internally for update comparisons)
+   are collected and, once a specified number (chunk size) of new pages is reached,
+   saved in a meta JSONL file named as: meta/index_{YYYYMMDDhhmmss}_{chunkNum}.jsonl.
+   This file is then uploaded to GCS. Each such meta file thus represents the cumulative
+   new records processed in that chunk.
 
-After a successful download, the script sleeps for 3 seconds to avoid overwhelming the server.
+Determination of updated pages:
+  - The sitemap provides a lastmod timestamp for each URL.
+  - This script downloads the latest meta file (if available) from GCS (from the prefix specified by GCS_META_PREFIX)
+    and loads records (each includes "url" and "fetched_at").
+  - For each URL in the current sitemap, if a previous record exists for that URL with
+    fetched_at >= sitemap.lastmod, it is skipped; otherwise, the page is fetched and a new record is created.
+  - Even if the same URL appears again with an update, a new record is created so that the latest data
+    can be determined by the combination of URL and fetched_at.
 
-The SQLite table "pages" has the following columns:
-  - id: auto-increment primary key (INTEGER)
-  - original_filename: the file part of the URL (e.g., "/index.php?plugin=sitemap")
-  - created_at: timestamp of the last download (ISO format)
+Output and upload:
+  - HTML files are individually uploaded to GCS under the path specified by GCS_HTML_PREFIX.
+  - Meta JSONL files are written in chunks (chunk size configurable via --meta-chunk-size, default 10)
+    and uploaded under GCS_META_PREFIX.
+  
+Environment Variables:
+  - GCS_BUCKET_NAME: Name of the GCS bucket (required).
+  - GCS_HTML_PREFIX: GCS folder prefix for HTML files (default: "html/").
+  - GCS_META_PREFIX: GCS folder prefix for meta JSONL files (default: "meta/").
+
+Additionally, the GCS project name can be specified via the --gcs-project argument.
 
 Usage:
-    python crawler.py [--sitemap-url SITEMAP_URL] [--urls url1 url2 ...]
-If --urls is provided, those URLs will be used (with no lastmod information). Otherwise, URLs are fetched from
-the sitemap, which defaults to "https://arknights.wikiru.jp/index.php?plugin=sitemap".
+    python crawler.py [--sitemap-url SITEMAP_URL] [--meta-chunk-size N] [--gcs-project PROJECT]
+If no sitemap URL is provided, the default is used.
 """
 
 import os
-import sqlite3
 import requests
 import argparse
 import time
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
+import re
 
-DB_PATH: Path = Path("output/index.db")
-DEST_DIR: Path = Path("output/original_html")
+from google.cloud import storage
+
+# Configuration for local temporary storage
+LOCAL_HTML_DIR: Path = Path("/tmp/html")
+LOCAL_META_FILE: Path = Path("/tmp/latest_meta.jsonl")
+
+# GCS configurations from environment variables
+GCS_BUCKET_NAME: str = os.environ.get("GCS_BUCKET_NAME", "")
+GCS_HTML_PREFIX: str = os.environ.get("GCS_HTML_PREFIX", "html/")
+GCS_META_PREFIX: str = os.environ.get("GCS_META_PREFIX", "meta/")
+
+def get_storage_client(project: Optional[str] = None) -> storage.Client:
+    """Creates and returns a GCS storage client, using the specified project if provided."""
+    if project:
+        return storage.Client(project=project)
+    return storage.Client()
+
+def download_from_gcs(bucket_name: str, source_blob_name: str, destination_file_name: str, project: Optional[str] = None) -> bool:
+    """Downloads a blob from GCS to a local file."""
+    try:
+        client = get_storage_client(project)
+        bucket = client.get_bucket(bucket_name)
+        blob = bucket.blob(source_blob_name)
+        if blob.exists():
+            blob.download_to_filename(destination_file_name)
+            print(f"Downloaded {source_blob_name} from GCS to {destination_file_name}")
+            return True
+        else:
+            print(f"Blob {source_blob_name} does not exist in bucket {bucket_name}.")
+            return False
+    except Exception as ex:
+        print(f"Error downloading {source_blob_name} from GCS: {ex}")
+        return False
+
+def upload_to_gcs(bucket_name: str, source_file_name: str, destination_blob_name: str, project: Optional[str] = None) -> bool:
+    """Uploads a file to GCS."""
+    try:
+        client = get_storage_client(project)
+        bucket = client.get_bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+        blob.upload_from_filename(source_file_name)
+        print(f"Uploaded {source_file_name} to GCS as {destination_blob_name}")
+        return True
+    except Exception as ex:
+        print(f"Error uploading {source_file_name} to GCS: {ex}")
+        return False
 
 def extract_file_name(url: str) -> str:
     """
     Extracts the file part (path and query) from a URL, excluding the scheme and domain.
-    
-    Args:
-        url (str): The full URL.
-        
-    Returns:
-        str: The extracted file part.
     """
     parsed = urlparse(url)
     file_name = parsed.path
@@ -56,164 +114,9 @@ def extract_file_name(url: str) -> str:
         file_name += '?' + parsed.query
     return file_name
 
-def init_db() -> sqlite3.Connection:
+def parse_sitemap(sitemap_url: str) -> List[Tuple[str, Optional[str]]]:
     """
-    Initializes the SQLite database connection.
-    
-    Returns:
-        sqlite3.Connection: The SQL connection object.
-    """
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            original_filename TEXT NOT NULL UNIQUE,
-            created_at DATETIME NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    return conn
-
-def get_registered_record(conn: sqlite3.Connection, file_name: str) -> Optional[Tuple[int, str]]:
-    """
-    Checks if the file name is already registered in the database.
-    
-    Args:
-        conn (sqlite3.Connection): The SQLite connection.
-        file_name (str): The file part of the URL.
-        
-    Returns:
-        Optional[Tuple[int, str]]: Tuple of (id, created_at) if the record exists; None otherwise.
-    """
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, created_at FROM pages WHERE original_filename = ?", (file_name,))
-    result = cursor.fetchone()
-    return (result[0], result[1]) if result else None
-
-def register_url(conn: sqlite3.Connection, file_name: str) -> int:
-    """
-    Registers the file name into the database, returning a unique ID.
-    
-    Args:
-        conn (sqlite3.Connection): The SQLite connection.
-        file_name (str): The file part of the URL.
-    
-    Returns:
-        int: The auto-generated ID.
-    """
-    cursor = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    cursor.execute(
-        "INSERT INTO pages (original_filename, created_at) VALUES (?, ?)",
-        (file_name, timestamp)
-    )
-    conn.commit()
-    return cursor.lastrowid
-
-def update_record(conn: sqlite3.Connection, record_id: int) -> None:
-    """
-    Updates the created_at field of an existing record to the current time.
-    
-    Args:
-        conn (sqlite3.Connection): The SQLite connection.
-        record_id (int): The ID of the record to update.
-    """
-    cursor = conn.cursor()
-    timestamp = datetime.now().isoformat()
-    cursor.execute("UPDATE pages SET created_at = ? WHERE id = ?", (timestamp, record_id))
-    conn.commit()
-
-def download_page(url: str) -> Optional[str]:
-    """
-    Downloads the content of the specified URL.
-    
-    Args:
-        url (str): The URL to download.
-        
-    Returns:
-        Optional[str]: The content of the page if successful; None otherwise.
-    """
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return response.text
-    except Exception as ex:
-        print(f"Failed to download {url}: {ex}")
-        return None
-
-def process_urls(urls: List[Tuple[str, Optional[str]]]) -> None:
-    """
-    Processes a list of URLs with optional lastmod information:
-      - For each URL, extracts the file part and checks if it is already registered.
-      - If registered, and a lastmod is provided, compares lastmod with the stored created_at.
-        If the lastmod is more recent, re-downloads the page and updates the record.
-      - If not registered, registers the URL and downloads the page.
-      - Saves the page content as output/original_html/{id}.html.
-      - Sleeps for 3 seconds after a successful download.
-    
-    Args:
-        urls (List[Tuple[str, Optional[str]]]): List of tuples (url, lastmod). lastmod may be None.
-    """
-    DEST_DIR.mkdir(parents=True, exist_ok=True)
-    conn = init_db()
-    
-    for url, lastmod in urls:
-        file_name = extract_file_name(url)
-        record = get_registered_record(conn, file_name)
-        download_needed = False
-        
-        if record:
-            record_id, created_at_str = record
-            if lastmod:
-                try:
-                    sitemap_lastmod = datetime.fromisoformat(lastmod.replace("Z", "+00:00"))
-                    record_created = datetime.fromisoformat(created_at_str)
-                    if sitemap_lastmod > record_created:
-                        print(f"Update needed for {file_name}: sitemap lastmod {lastmod} is newer than record {created_at_str}.")
-                        download_needed = True
-                    else:
-                        print(f"No update for {file_name}: record is up-to-date.")
-                except Exception as ex:
-                    print(f"Error comparing dates for {file_name}: {ex}. Skipping update.")
-            else:
-                print(f"{file_name} is already registered with ID {record_id}.")
-        else:
-            download_needed = True
-        
-        if download_needed:
-            if not record:
-                record_id = register_url(conn, file_name)
-                print(f"Registered {file_name} with new ID {record_id}")
-            else:
-                print(f"Re-downloading {file_name} for update (ID {record_id})")
-            
-            content = download_page(url)
-            if content is None:
-                print(f"Skipping {url} due to download failure.")
-                continue
-            
-            file_path = DEST_DIR / f"{record_id}.html"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            update_record(conn, record_id)
-            print(f"Saved content of {url} as {file_path.name}")
-            time.sleep(3)  # Sleep for 3 seconds after successful download
-    
-    conn.close()
-
-def get_sitemap_urls(sitemap_url: str) -> List[Tuple[str, Optional[str]]]:
-    """
-    Fetches the sitemap XML from the provided URL and extracts URLs along with their lastmod values.
-    
-    Args:
-        sitemap_url (str): The URL of the sitemap XML.
-    
-    Returns:
-        List[Tuple[str, Optional[str]]]: List of tuples (url, lastmod). lastmod may be None.
+    Fetches and parses the sitemap XML, returning a list of tuples: (url, lastmod).
     """
     try:
         response = requests.get(sitemap_url, timeout=10)
@@ -222,7 +125,6 @@ def get_sitemap_urls(sitemap_url: str) -> List[Tuple[str, Optional[str]]]:
     except Exception as ex:
         print(f"Failed to download sitemap from {sitemap_url}: {ex}")
         return []
-    
     try:
         root = ET.fromstring(xml_content)
         namespace = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
@@ -232,42 +134,242 @@ def get_sitemap_urls(sitemap_url: str) -> List[Tuple[str, Optional[str]]]:
             lastmod_element = url_element.find("ns:lastmod", namespace)
             if loc_element is not None and loc_element.text:
                 loc = loc_element.text.strip()
-                lastmod = lastmod_element.text.strip() if (lastmod_element is not None and lastmod_element.text) else None
+                lastmod = (lastmod_element.text.strip() if lastmod_element is not None and lastmod_element.text else None)
                 urls.append((loc, lastmod))
         return urls
     except Exception as ex:
         print(f"Failed to parse sitemap XML: {ex}")
         return []
 
-def parse_arguments() -> List[Tuple[str, Optional[str]]]:
+def load_previous_meta(project: Optional[str] = None) -> List[Dict]:
     """
-    Parses command line arguments to retrieve URLs.
-    If --urls is provided, returns them as tuples with lastmod set to None.
-    Otherwise, fetches URLs from the sitemap (defaults to "https://arknights.wikiru.jp/index.php?plugin=sitemap").
+    Loads previous meta records from the latest meta file in GCS under the prefix GCS_META_PREFIX.
+    It lists blobs in the bucket with that prefix, selects the one with the latest timestamp
+    (extracted from its filename), downloads it, and loads its JSONL records.
+    Each record contains: id, filename, fetched_at, url.
+    """
+    records = []
+    LOCAL_META_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        client = get_storage_client(project)
+        bucket = client.get_bucket(GCS_BUCKET_NAME)
+        blobs = list(bucket.list_blobs(prefix=GCS_META_PREFIX))
+        latest_blob = None
+        latest_ts = None
+        pattern = re.compile(r'index_(\d{14})')
+        for blob in blobs:
+            m = pattern.search(blob.name)
+            if m:
+                ts_str = m.group(1)
+                ts = datetime.strptime(ts_str, "%Y%m%d%H%M%S")
+                if (latest_ts is None) or (ts > latest_ts):
+                    latest_ts = ts
+                    latest_blob = blob
+        if latest_blob:
+            print(f"Latest meta file in GCS: {latest_blob.name}")
+            latest_blob.download_to_filename(str(LOCAL_META_FILE))
+            print(f"Downloaded latest meta file {latest_blob.name} to {LOCAL_META_FILE}")
+        else:
+            print("No meta file found in GCS under the specified prefix.")
+    except Exception as e:
+        print(f"Error loading meta files from GCS: {e}")
+        return records
+    if LOCAL_META_FILE.exists():
+        with open(LOCAL_META_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    records.append(record)
+                except Exception as ex:
+                    print(f"Error parsing meta record: {ex}")
+    return records
+
+def save_meta_chunk(meta_records: List[Dict], chunk_num: int) -> Path:
+    """
+    Writes the provided meta_records as a single JSONL file.
+    The file is named as: meta/index_{timestamp}_{chunkNum}.jsonl, where timestamp is in YYYYMMDDhhmmss format.
+    Returns the path to the generated file.
+    Each record output includes: id, filename, fetched_at.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    output_path = Path(f"/tmp/meta/index_{timestamp}_{chunk_num}.jsonl")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for record in meta_records:
+            out_record = {
+                "id": record["id"],
+                "filename": record["filename"],
+                "fetched_at": record["fetched_at"]
+            }
+            f.write(json.dumps(out_record) + "\n")
+    return output_path
+
+def download_page(url: str) -> Optional[str]:
+    """
+    Downloads the content of the specified URL.
+    """
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except Exception as ex:
+        print(f"Failed to download {url}: {ex}")
+        return None
+
+def process_updates(sitemap_url: str, meta_chunk_size: int, project: Optional[str] = None) -> None:
+    """
+    Processes the sitemap, fetches pages that are updated relative to previous meta data,
+    outputs each HTML file with a new id, and creates meta records.
+    HTML files and new meta records are immediately uploaded to GCS.
     
-    Returns:
-        List[Tuple[str, Optional[str]]]: List of tuples (url, lastmod).
+    This function accumulates new meta records. Once the number of new records reaches the chunk size,
+    it flushes them: saving them as a meta JSONL file (named meta/index_{timestamp}_{chunkNum}.jsonl) and uploading it to GCS.
+    After processing all URLs, if any new records remain (less than the chunk size), they are also flushed.
+    
+    For each URL in the sitemap:
+      - If a previous record exists with fetched_at >= sitemap.lastmod, skip.
+      - Otherwise, download the page and create a new record.
     """
-    parser = argparse.ArgumentParser(description="Download pages using SQLite for indexing with sitemap support.")
-    parser.add_argument(
-        "--sitemap-url",
-        type=str,
-        default="https://arknights.wikiru.jp/index.php?plugin=sitemap",
-        help="URL of the sitemap XML. Defaults to 'https://arknights.wikiru.jp/index.php?plugin=sitemap'."
-    )
-    parser.add_argument(
-        "--urls",
-        nargs="*",
-        help="List of URLs to process. If provided, these URLs will be used with no lastmod info."
-    )
-    args = parser.parse_args()
-    if args.urls and len(args.urls) > 0:
-        return [(url, None) for url in args.urls]
-    return get_sitemap_urls(args.sitemap_url)
+    LOCAL_HTML_DIR.mkdir(parents=True, exist_ok=True)
+    
+    sitemap_entries = parse_sitemap(sitemap_url)
+    print(f"Found {len(sitemap_entries)} URLs in sitemap.")
+    
+    previous_meta = load_previous_meta(project)
+    # Build lookup: url -> latest fetched_at from previous meta.
+    url_latest: Dict[str, datetime] = {}
+    for record in previous_meta:
+        try:
+            rec_url = record["url"]
+            fetched_at = datetime.fromisoformat(record["fetched_at"])
+            if rec_url in url_latest:
+                if fetched_at > url_latest[rec_url]:
+                    url_latest[rec_url] = fetched_at
+            else:
+                url_latest[rec_url] = fetched_at
+        except Exception as ex:
+            print(f"Error processing previous meta record: {ex}")
+    
+    new_meta_records: List[Dict] = []
+    cumulative_meta = previous_meta.copy()
+    next_id = 1
+    if previous_meta:
+        try:
+            max_id = max(record["id"] for record in previous_meta)
+            next_id = max_id + 1
+        except Exception:
+            pass
+
+    chunk_counter = 0
+    for url, lastmod in sitemap_entries:
+        fetch_required = False
+        try:
+            if lastmod:
+                sitemap_lastmod = datetime.fromisoformat(lastmod.replace("Z", "+00:00"))
+            else:
+                sitemap_lastmod = None
+        except Exception as ex:
+            print(f"Error parsing lastmod for {url}: {ex}")
+            sitemap_lastmod = None
+
+        if url in url_latest and sitemap_lastmod is not None:
+            if sitemap_lastmod > url_latest[url]:
+                print(f"Update detected for {url}.")
+                fetch_required = True
+            else:
+                print(f"No update for {url}. Skipping.")
+        else:
+            fetch_required = True
+
+        if fetch_required:
+            content = download_page(url)
+            if content is None:
+                print(f"Failed to download {url}.")
+                continue
+            html_filename = f"{next_id}.html"
+            local_html_path = LOCAL_HTML_DIR / html_filename
+            with open(local_html_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            print(f"Saved HTML for {url} as {html_filename}.")
+            if GCS_BUCKET_NAME:
+                destination_blob = os.path.join(GCS_HTML_PREFIX, html_filename)
+                upload_to_gcs(GCS_BUCKET_NAME, str(local_html_path), destination_blob, project)
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            new_record = {
+                "id": next_id,
+                "filename": html_filename,
+                "fetched_at": fetched_at,
+                "url": url
+            }
+            new_meta_records.append(new_record)
+            cumulative_meta.append(new_record)
+            next_id += 1
+            time.sleep(3)
+            # If new_meta_records reached the chunk size, flush them.
+            if len(new_meta_records) >= meta_chunk_size:
+                chunk_counter += 1
+                meta_chunk_path = save_meta_chunk(new_meta_records, chunk_counter)
+                if GCS_BUCKET_NAME:
+                    destination_blob = os.path.join(GCS_META_PREFIX, meta_chunk_path.name)
+                    upload_to_gcs(GCS_BUCKET_NAME, str(meta_chunk_path), destination_blob, project)
+                # Clear the new records for new chunk.
+                new_meta_records.clear()
+                # Update LOCAL_META_FILE with cumulative meta.
+                with open(LOCAL_META_FILE, "w", encoding="utf-8") as f:
+                    for record in cumulative_meta:
+                        f.write(json.dumps(record) + "\n")
+                print(f"Flushed meta chunk {chunk_counter}; cumulative meta records: {len(cumulative_meta)}.")
+
+    # Flush any remaining new meta records if they did not reach chunk_size.
+    if new_meta_records:
+        chunk_counter += 1
+        meta_chunk_path = save_meta_chunk(new_meta_records, chunk_counter)
+        if GCS_BUCKET_NAME:
+            destination_blob = os.path.join(GCS_META_PREFIX, meta_chunk_path.name)
+            upload_to_gcs(GCS_BUCKET_NAME, str(meta_chunk_path), destination_blob, project)
+        new_meta_records.clear()
+        with open(LOCAL_META_FILE, "w", encoding="utf-8") as f:
+            for record in cumulative_meta:
+                f.write(json.dumps(record) + "\n")
+        print(f"Flushed final meta chunk {chunk_counter}; total meta records: {len(cumulative_meta)}.")
+
+def save_meta_chunk(meta_records: List[Dict], chunk_num: int) -> Path:
+    """
+    Writes the provided meta_records as a single JSONL file.
+    The file is named as: meta/index_{YYYYMMDDhhmmss}_{chunkNum}.jsonl.
+    Returns the path to the generated file.
+    Each record output includes: id, filename, fetched_at.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    output_path = Path(f"/tmp/meta/index_{timestamp}_{chunk_num}.jsonl")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for record in meta_records:
+            out_record = {
+                "id": record["id"],
+                "filename": record["filename"],
+                "fetched_at": record["fetched_at"]
+            }
+            f.write(json.dumps(out_record) + "\n")
+    return output_path
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Crawl sitemap and fetch updated pages, outputting HTML and meta JSONL files to GCS.")
+    parser.add_argument("--sitemap-url", type=str, default="https://arknights.wikiru.jp/index.php?plugin=sitemap",
+                        help="URL of the sitemap XML. Defaults to https://arknights.wikiru.jp/index.php?plugin=sitemap")
+    parser.add_argument("--meta-chunk-size", type=int, default=10,
+                        help="Number of new meta records per JSONL chunk file. Default is 10.")
+    parser.add_argument("--gcs-project", type=str, default="",
+                        help="GCS project name. Optional if set via environment variable.")
+    return parser.parse_args()
+
+def main() -> None:
+    args = parse_arguments()
+    project = args.gcs_project if args.gcs_project else None
+    if not GCS_BUCKET_NAME:
+        print("GCS_BUCKET_NAME environment variable is not set. Exiting.")
+    else:
+        process_updates(args.sitemap_url, args.meta_chunk_size, project)
 
 if __name__ == "__main__":
-    urls_to_crawl = parse_arguments()
-    if not urls_to_crawl:
-        print("No URLs found to process.")
-    else:
-        process_urls(urls_to_crawl)
+    main()
