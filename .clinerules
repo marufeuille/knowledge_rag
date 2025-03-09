@@ -102,20 +102,30 @@ uv run python -m arknights_crawler.cli crawl --gcp_project_id hogehoge --gcs_buc
 
 ## データの前処理
 
-背景: 取得したhtmlはメニュー部分などどのページにも入っている不要な情報が多くあるので除去したい
+背景
+- 取得したhtmlはメニュー部分などどのページにも入っている不要な情報が多くあるので除去したい
 
-対象データ: クローリングで獲得したデータ
+対象データ
+- クローリングで獲得したデータ。GCSの特定ディレクトリ(html/)以下にある。
 
-抽出対象: div#bodyのタグ配下のhtml。htmlタグも有効な情報になり得るのでタグの除去はしない
+抽出対象
+- `div#body` のタグ配下のhtml。htmlタグも有効な情報になり得るのでタグの除去はしない
 
-出力先: 指定されたGCS上の output/extracted/{id}.html に抽出された部分のみを保存する
+出力先
+- 指定されたGCS上の output/extracted/{id}.html に抽出された部分のみを保存する
 
-メタデータ: id, original_html_id(crawler側のidへのFK相当), processed_at を output/meta/extracted_{YYYYMMDDhhmss}_{chunk_id}.jsonl として保存する
+メタデータ
+- 以下のデータを出力する
+  - id: 自動採番
+  - original_html_id: crawler側のidへのFK相当
+  - processed_at: 処理した時刻
+- output/meta/extracted_{YYYYMMDDhhmss}.jsonl として保存する
 
-引数:
+引数
 - --input-dir: 元となるhtmlがあるディレクトリ(通常はcrawler.pyの出力先に等しい)
 - --meta-chunk-size: メタデータのレコード(JSONL)をファイル出力する単位
 - --gcs-project: Google Cloud Storageのあるプロジェクト名
+- --gcs-bucket-name: in/outに使うGCSのバケット名
 
 # 設計
 ## ソフトウェアアーキテクチャ

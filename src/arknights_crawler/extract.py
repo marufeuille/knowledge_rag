@@ -1,283 +1,287 @@
 #!/usr/bin/env python3
 """
-Extract script for CloudRun jobs with assets stored on GCS.
+Extract module for processing crawled HTML files from Google Cloud Storage.
 
-This script performs data preprocessing on the crawled HTML data.
-It processes the HTML files obtained by the crawler (located by default in "output/original_html"),
-extracts the inner HTML of the <div id="body"> element (keeping its HTML tags intact), and saves
-the extracted portion as new HTML files. The extracted files are saved locally in "output/html" and then
-uploaded to GCS under the same "output/html" folder.
+This module connects to Google Cloud Storage to:
+  1. Retrieve the latest metadata file from the meta/ directory in the bucket and determine the
+     maximum processed metadata IDs.
+  2. List HTML files in the html/ folder whose original_html_id is greater than the maximum
+     already processed.
+  3. Download each new HTML file, extract the content within the <div id="body"> tag,
+     and upload the extracted HTML to output/extracted/.
+  4. Accumulate metadata for each processed file and, in chunks, upload JSONL files to
+     output/meta/.
 
-Additionally, for each extraction, metadata is recorded including:
-  - id: the extraction id (new sequential id)
-  - original_html_id: the id from the crawler (extracted from the original filename, assumed numeric)
-  - processed_at: the timestamp when the extraction was performed
-
-Once a specified number (chunk size) of new extractions is accumulated, the metadata records
-are saved in a JSON Lines file named as: meta/index_{YYYYMMDDhhmmss}_{chunkNum}.jsonl and uploaded to GCS.
-Each such meta file thus represents the cumulative new extraction records in that chunk.
-
-Usage:
-    python extract.py [--input-dir INPUT_DIR] [--meta-chunk-size N] [--gcs-project PROJECT]
-
-Environment Variables:
-  - GCS_BUCKET_NAME: Name of the GCS bucket (required).
-  - GCS_EXTRACTED_PREFIX: GCS folder prefix for extracted HTML files (default: "extracted/").
-    (Note: Although the local output directory is "output/html", extraction upload to GCS will use this prefix
-     if desired; adjust as needed.)
-  - GCS_META_PREFIX: GCS folder prefix for meta JSONL files (default: "meta/").
-  - GCS_PROJECT_ID: (Optional) GCS project id to be used if not provided via --gcs-project.
-
-If no input directory is provided, it defaults to "output/original_html".
+The design is implemented with pure functions for business logic and isolates I/O operations.
 """
 
 import json
 import os
-import tempfile
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, List
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
 
 from bs4 import BeautifulSoup
 from google.cloud import storage
 
-# Local meta file to store cumulative meta records
-LOCAL_META_FILE: Path = Path("/tmp/last_extracted_meta.jsonl")
 
-# GCS configurations from environment variables
-GCS_BUCKET_NAME: str = os.environ.get("GCS_BUCKET_NAME", "")
-GCS_META_PREFIX: str = os.environ.get("GCS_META_PREFIX", "meta/")
+# ---------------------------
+# Pure functions for HTML extraction
+# ---------------------------
+def extract_body(html: str) -> str:
+    """Extract HTML content within the div having id 'body'.
 
+    This function uses BeautifulSoup to parse the given HTML text and extract the
+    inner HTML of the <div id="body"> element. The outer div tag is excluded, only
+    its children are returned.
 
-def get_storage_client(project: str | None = None) -> storage.Client:
-    """Creates and returns a GCS storage client using the specified project or the environment variable GCS_PROJECT_ID."""
-    project = project or os.environ.get("GCS_PROJECT_ID", None)
-    if project:
-        return storage.Client(project=project)
-    return storage.Client()
+    Args:
+        html (str): The input HTML content as a string.
 
-
-def upload_to_gcs(
-    bucket_name: str,
-    source_file: str,
-    destination_blob: str,
-    project: str | None = None,
-) -> bool:
-    """Uploads a local file to GCS."""
-    try:
-        client = get_storage_client(project)
-        bucket = client.get_bucket(bucket_name)
-        blob = bucket.blob(destination_blob)
-        blob.upload_from_filename(source_file)
-        print(f"Uploaded {source_file} to GCS as {destination_blob}")
-        return True
-    except Exception as ex:
-        print(f"Error uploading {source_file} to GCS: {ex}")
-        return False
-
-
-def extract_body(html_content: str) -> str:
+    Returns:
+        str: The inner HTML of the div with id 'body'. Returns an empty string if not found.
     """
-    Extracts the inner HTML of the <div id="body"> element from the provided HTML content.
-    Returns the inner HTML (including tags) if found, otherwise an empty string.
-    """
-    soup = BeautifulSoup(html_content, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     body_div = soup.find("div", id="body")
     if body_div:
-        return "".join(str(child) for child in body_div.contents)
-    else:
-        print("No <div id='body'> found in the HTML.")
-        return ""
+        return "".join(str(child) for child in body_div.children)
+    return ""
 
 
-def load_previous_meta() -> List[Dict]:
+def process_html_content(
+    original_html_id: str, html_content: str, new_id: int
+) -> Tuple[str, Dict[str, Any]]:
+    """Process HTML content to extract target segment and create metadata.
+
+    Extracts content using extract_body and compiles metadata including a new auto-assigned
+    ID, the original HTML ID derived from GCS blob name, and the current processing timestamp.
+
+    Args:
+        original_html_id (str): The original identifier derived from the HTML file name.
+        html_content (str): The HTML content as a string.
+        new_id (int): The new auto-assigned ID for the extraction.
+
+    Returns:
+        Tuple[str, Dict[str, Any]]: A tuple with the extracted HTML content and its metadata.
     """
-    Loads previous extraction meta records from the local meta file, if it exists.
-    Each record is a dict with keys: id, original_html_id, processed_at.
+    extracted_html = extract_body(html_content)
+    processed_at = datetime.now(datetime.timezone.utc).isoformat() + "Z"
+    meta = {
+        "id": new_id,
+        "original_html_id": original_html_id,
+        "processed_at": processed_at,
+    }
+    return extracted_html, meta
+
+
+# ---------------------------
+# GCS Helper Functions
+# ---------------------------
+def get_latest_max_ids(
+    bucket: storage.bucket.Bucket, meta_prefix: str = "meta/index_"
+) -> Tuple[int, int]:
+    """Retrieve the maximum processed id and maximum original_html_id from the latest metadata file in GCS.
+
+    It lists all blobs under the given meta_prefix, selects the one with the highest timestamp based
+    on its filename, reads its JSONL content, and finds the maximum values.
+    Assumes that both 'id' and 'original_html_id' can be interpreted as integers.
+
+    Args:
+        bucket (storage.bucket.Bucket): The GCS bucket object.
+        meta_prefix (str): The prefix in the bucket where metadata files are stored.
+
+    Returns:
+        Tuple[int, int]: A tuple (max_meta_id, max_original_html_id). Returns (0, 0) if no metadata file exists.
     """
-    records: List[Dict] = []
-    if LOCAL_META_FILE.exists():
-        with open(LOCAL_META_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    record = json.loads(line)
-                    records.append(record)
-                except Exception as ex:
-                    print(f"Error parsing meta record: {ex}")
-    return records
+    blobs = list(bucket.list_blobs(prefix=meta_prefix))
+    if not blobs:
+        return 0, 0
+
+    # Select the blob with the highest (latest) timestamp in its filename.
+    latest_blob = max(
+        blobs,
+        key=lambda b: b.name.split("_")[-1].split(".")[0] if "_" in b.name else "",
+    )
+
+    try:
+        content = latest_blob.download_as_text(encoding="utf-8")
+    except Exception:
+        return 0, 0
+
+    max_meta_id = 0
+    max_original_id = 0
+    for line in content.splitlines():
+        try:
+            record = json.loads(line)
+            record_id = int(record.get("id", 0))
+            original_id = int(record.get("original_html_id", 0))
+            if record_id > max_meta_id:
+                max_meta_id = record_id
+            if original_id > max_original_id:
+                max_original_id = original_id
+        except (ValueError, json.JSONDecodeError):
+            continue
+    return max_meta_id, max_original_id
 
 
-def save_meta_chunk(meta_records: List[Dict], chunk_num: int) -> Path:
+def list_new_html_blobs(
+    bucket: storage.bucket.Bucket, html_prefix: str = "html/", min_original_id: int = 0
+) -> List[storage.Blob]:
+    """List HTML blobs in the bucket with original_html_id greater than min_original_id.
+
+    Assumes that HTML files are stored under html_prefix and each file name (without extension)
+    represents the original_html_id, which can be converted to an integer.
+
+    Args:
+        bucket (storage.bucket.Bucket): The GCS bucket object.
+        html_prefix (str): The prefix where HTML files are stored.
+        min_original_id (int): The minimum original_html_id that has been processed.
+
+    Returns:
+        List[storage.Blob]: A list of GCS Blob objects for new HTML files to process.
     """
-    Writes the provided meta_records as a single JSONL file.
-    The file is named as: meta/index_{timestamp}_{chunkNum}.jsonl, where timestamp is in YYYYMMDDhhmmss format.
-    Returns the path to the generated file.
-    Each record output includes: id, original_html_id, processed_at.
-    """
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    output_path = Path(f"/tmp/meta/index_{timestamp}_{chunk_num}.jsonl")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        for record in meta_records:
-            out_record = {
-                "id": record["id"],
-                "original_html_id": record["original_html_id"],
-                "processed_at": record["processed_at"],
-            }
-            f.write(json.dumps(out_record) + "\n")
-    return output_path
+    new_blobs = []
+    blobs = bucket.list_blobs(prefix=html_prefix)
+    for blob in blobs:
+        base_name = os.path.basename(blob.name)
+        original_id_str, ext = os.path.splitext(base_name)
+        try:
+            original_id = int(original_id_str)
+            if original_id > min_original_id:
+                new_blobs.append(blob)
+        except ValueError:
+            continue
+    new_blobs.sort(key=lambda b: int(os.path.splitext(os.path.basename(b.name))[0]))
+    return new_blobs
 
 
-def process_extractions(
-    input_dir: Path,
-    output_dir: Path,
-    meta_output_dir: Path,
-    meta_chunk_size: int,
-    project: str,
+def upload_string_to_gcs(
+    bucket: storage.bucket.Bucket,
+    destination_blob_name: str,
+    content: str,
+    content_type: str,
 ) -> None:
-    """
-    Processes HTML files in the input directory:
-      - For each HTML file, extracts the content of <div id="body">.
-      - Saves the extracted content locally as output/html/{extraction_id}.html.
-      - Creates a meta record with keys: id (extraction id), original_html_id (from filename), processed_at.
-      - As soon as the number of new extraction records reaches the chunk size,
-        writes these records into a meta JSONL file and uploads it to GCS.
-      - Each extracted HTML file is also uploaded to GCS under extracted/{extraction_id}.html.
-      - All extracted files and meta files are retained locally.
-    """
+    """Upload a string content to GCS at the specified blob destination.
 
-    html_files = sorted(input_dir.glob("*.html"), key=lambda x: int(x.stem))
-    print(f"Found {len(html_files)} original HTML files in {input_dir}.")
+    Args:
+        bucket (storage.bucket.Bucket): The GCS bucket object.
+        destination_blob_name (str): The destination path in the bucket.
+        content (str): The content to upload.
+        content_type (str): The MIME type of the content.
+    """
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_string(content, content_type=content_type)
 
-    new_meta_records: List[Dict] = []
-    cumulative_meta = load_previous_meta()
-    next_extraction_id = 1
-    if cumulative_meta:
+
+# ---------------------------
+# Main extraction process using GCS
+# ---------------------------
+def run_extraction(
+    input_dir: str, meta_chunk_size: int, gcs_project: str, gcs_bucket_name: str
+) -> None:
+    """Run the extraction process by interfacing with Google Cloud Storage.
+
+    1. Connects to GCS using provided project and bucket names.
+    2. Retrieves the latest metadata file to determine the maximum processed IDs.
+    3. Lists new HTML files in the 'html/' folder with original_html_id greater than the maximum processed.
+    4. For each new HTML file:
+         - Downloads the file content.
+         - Extracts the target HTML segment.
+         - Uploads the extracted HTML to 'output/extracted/{new_id}.html'.
+         - Accumulates metadata.
+    5. Uploads metadata in chunks to 'output/meta/' as JSONL files.
+
+    Args:
+        input_dir (str): Not used; provided for compatibility with CLI wrapper.
+        meta_chunk_size (int): Number of metadata records per output JSONL file.
+        gcs_project (str): Google Cloud Storage project name.
+        gcs_bucket_name (str): Google Cloud Storage bucket name.
+    """
+    client = storage.Client(project=gcs_project)
+    bucket = client.bucket(gcs_bucket_name)
+
+    # Retrieve maximum IDs from the latest metadata file
+    max_meta_id, max_original_id = get_latest_max_ids(
+        bucket,
+        meta_prefix="meta/index_",
+    )
+    new_id = max_meta_id + 1
+
+    # List new HTML blobs from 'html/' folder
+    new_html_blobs = list_new_html_blobs(
+        bucket, html_prefix="html/", min_original_id=max_original_id
+    )
+
+    meta_records: List[Dict[str, Any]] = []
+
+    for blob in new_html_blobs:
+        base_name = os.path.basename(blob.name)
+        original_html_id, _ = os.path.splitext(base_name)
         try:
-            max_id = max(record["id"] for record in cumulative_meta)
-            next_extraction_id = max_id + 1
+            html_content = blob.download_as_text(encoding="utf-8")
         except Exception:
-            pass
-    chunk_counter = 0
-    for file in html_files:
-        try:
-            original_html_id = int(file.stem)
-        except Exception:
-            print(f"Skipping non-numeric file: {file.name}")
             continue
-        with open(file, "r", encoding="utf-8") as f:
-            html_content = f.read()
-        extracted_content = extract_body(html_content)
-        if not extracted_content:
-            print(f"No content extracted from {file.name}. Skipping.")
-            continue
-        extracted_filename = f"{next_extraction_id}.html"
-        local_extracted_path = output_dir / extracted_filename
-        with open(local_extracted_path, "w", encoding="utf-8") as f:
-            f.write(extracted_content)
-        print(f"Extracted content from {file.name} saved as {extracted_filename}.")
-        if GCS_BUCKET_NAME:
-            destination_blob = os.path.join(output_dir, extracted_filename)
-            upload_to_gcs(
-                GCS_BUCKET_NAME, str(local_extracted_path), destination_blob, project
+
+        extracted_html, meta = process_html_content(
+            original_html_id, html_content, new_id
+        )
+
+        # Upload extracted HTML to GCS: output/extracted/{new_id}.html
+        extracted_blob_name = f"extracted/{new_id}.html"
+        upload_string_to_gcs(
+            bucket, extracted_blob_name, extracted_html, content_type="text/html"
+        )
+
+        meta_records.append(meta)
+        new_id += 1
+
+        if len(meta_records) >= meta_chunk_size:
+            timestamp = datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+            meta_blob_name = f"meta/extracted_{timestamp}.jsonl"
+            meta_content = "\n".join(
+                json.dumps(record, ensure_ascii=False) for record in meta_records
             )
-        processed_at = datetime.now(timezone.utc).isoformat()
-        meta_record = {
-            "id": next_extraction_id,
-            "original_html_id": original_html_id,
-            "processed_at": processed_at,
-        }
-        new_meta_records.append(meta_record)
-        cumulative_meta.append(meta_record)
-        next_extraction_id += 1
-        if len(new_meta_records) >= meta_chunk_size:
-            chunk_counter += 1
-            meta_chunk_path = save_meta_chunk(new_meta_records, chunk_counter)
-            if GCS_BUCKET_NAME:
-                destination_blob = os.path.join(GCS_META_PREFIX, meta_chunk_path.name)
-                upload_to_gcs(
-                    GCS_BUCKET_NAME, str(meta_chunk_path), destination_blob, project
-                )
-            new_meta_records.clear()
-            with open(LOCAL_META_FILE, "w", encoding="utf-8") as f:
-                for record in cumulative_meta:
-                    f.write(json.dumps(record) + "\n")
-            print(
-                f"Flushed meta chunk {chunk_counter}; total extracted records: {len(cumulative_meta)}."
+            upload_string_to_gcs(
+                bucket, meta_blob_name, meta_content, content_type="application/json"
             )
-            time.sleep(1)
-    if new_meta_records:
-        chunk_counter += 1
-        meta_chunk_path = save_meta_chunk(new_meta_records, chunk_counter)
-        if GCS_BUCKET_NAME:
-            destination_blob = os.path.join(GCS_META_PREFIX, meta_chunk_path.name)
-            upload_to_gcs(
-                GCS_BUCKET_NAME, str(meta_chunk_path), destination_blob, project
-            )
-        new_meta_records.clear()
-        with open(LOCAL_META_FILE, "w", encoding="utf-8") as f:
-            for record in cumulative_meta:
-                f.write(json.dumps(record) + "\n")
-        print(
-            f"Flushed final meta chunk {chunk_counter}; total extracted records: {len(cumulative_meta)}."
+            meta_records = []
+
+    if meta_records:
+        timestamp = datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+        meta_blob_name = f"meta/extracted_{timestamp}.jsonl"
+        meta_content = "\n".join(
+            json.dumps(record, ensure_ascii=False) for record in meta_records
+        )
+        upload_string_to_gcs(
+            bucket, meta_blob_name, meta_content, content_type="application/json"
         )
 
 
 def main(
-    gcp_project: str,
-    local_output_parent_dir: str | None = None,
-    input_dir_prefix: str = "output/original_html",
-    output_dir_prefix: str = "output/extracted",
-    meta_output_dir_prefix: str = "output/meta",
-    meta_chunk_size: int = 100,
+    input_dir: str, meta_chunk_size: int, gcs_project: str, gcs_bucket_name: str
 ) -> None:
-    if not input_dir_prefix.exists():
-        print(f"Input directory {input_dir_prefix} does not exist. Exiting.")
-        return
-    if not GCS_BUCKET_NAME:
-        print("GCS_BUCKET_NAME environment variable is not set. Exiting.")
-        return
+    """Main entry point for the extraction process from GCS.
 
-    d: tempfile.TemporaryDirectory | None = None
-    if local_output_parent_dir is None:
-        d = tempfile.TemporaryDirectory()
-        local_output_parent_dir = d.name
-    local_output_parent_dir_path = Path(local_output_parent_dir)
-    local_output_parent_dir_path.mkdir(parents=True, exist_ok=True)
-    input_dir = Path(
-        os.path.join(
-            local_output_parent_dir_path,
-            input_dir_prefix,
-        )
-    )
-    output_dir = Path(
-        os.path.join(
-            local_output_parent_dir_path,
-            output_dir_prefix,
-        )
-    )
-    meta_output_dir = Path(
-        os.path.join(
-            local_output_parent_dir_path,
-            meta_output_dir_prefix,
-        )
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    meta_output_dir.mkdir(parents=True, exist_ok=True)
+    This function receives parameters (for future CLI integration) and triggers the
+    extraction process by invoking run_extraction.
 
-    try:
-        process_extractions(
-            input_dir_prefix,
-            output_dir_prefix,
-            meta_output_dir_prefix,
-            meta_chunk_size,
-            gcp_project,
-        )
-    finally:
-        if d:
-            d.cleanup()
+    Args:
+        input_dir (str): Provided for CLI compatibility (unused).
+        meta_chunk_size (int): Number of metadata records per JSONL file.
+        gcs_project (str): Google Cloud Storage project name.
+        gcs_bucket_name (str): Google Cloud Storage bucket name.
+    """
+    run_extraction(input_dir, meta_chunk_size, gcs_project, gcs_bucket_name)
 
 
 if __name__ == "__main__":
-    main()
+    # For testing purposes, sample parameters are defined below.
+    sample_input_dir = "unused_input_dir"  # Not used in GCS processing
+    sample_meta_chunk_size = 10  # Example metadata chunk size
+    sample_gcs_project = "my-sample-lab"
+    sample_gcs_bucket_name = "arknights-rag"
+    main(
+        sample_input_dir,
+        sample_meta_chunk_size,
+        sample_gcs_project,
+        sample_gcs_bucket_name,
+    )
